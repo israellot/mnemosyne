@@ -4292,7 +4292,8 @@ class BeamMemory:
                                 source: str = "consolidation", importance: float = 0.6,
                                 metadata: Dict = None, valid_until: str = None,
                                 scope: str = "session",
-                                veracity: Optional[str] = None) -> str:
+                                veracity: Optional[str] = None,
+                                tier: Optional[int] = None) -> str:
         """
         Store a consolidated summary into episodic_memory with optional embedding.
 
@@ -4304,6 +4305,15 @@ class BeamMemory:
         aggregate via `aggregate_veracity()` over the source rows' veracity
         values and pass it here. `None` falls back to 'unknown' (matches
         legacy behavior + schema default).
+
+        PATCH (yallaplay, upstream issue #506): `tier` kwarg sets the initial
+        degradation tier of the consolidated row. Pre-fix the INSERT omitted
+        the tier column, so every consolidation summary entered at the schema
+        default tier 1 (full 1.0x recall weight) and outranked the source
+        memories it paraphrases for TIER2_DAYS (30d). Derived data should not
+        outrank its sources by default. `None` reads
+        MNEMOSYNE_CONSOLIDATION_TIER (default "3" = 0.25x weight; set "1" to
+        restore legacy behavior). Values are clamped to {1, 2, 3}.
         """
         memory_id = _generate_id(summary)
         timestamp = datetime.now().isoformat()
@@ -4345,14 +4355,22 @@ class BeamMemory:
                     type(exc).__name__, exc,
                 )
         cursor = self.conn.cursor()
+        # PATCH (yallaplay, upstream issue #506): resolve + clamp initial tier
+        # and include it in the INSERT (previously omitted -> schema default 1).
+        if tier is None:
+            try:
+                tier = int(os.environ.get("MNEMOSYNE_CONSOLIDATION_TIER", "3"))
+            except (TypeError, ValueError):
+                tier = 3
+        row_tier = min(3, max(1, int(tier)))
         cursor.execute("""
             INSERT INTO episodic_memory
             (id, content, source, timestamp, session_id, importance, metadata_json, summary_of, valid_until, scope,
-             author_id, author_type, channel_id, memory_type, veracity)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             author_id, author_type, channel_id, memory_type, veracity, tier)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (memory_id, _sanitize_utf8(summary), source, timestamp, self.session_id, importance,
               json.dumps(metadata or {}), ",".join(source_wm_ids), valid_until, scope,
-              self.author_id, self.author_type, self.channel_id, ep_type, row_veracity))
+              self.author_id, self.author_type, self.channel_id, ep_type, row_veracity, row_tier))
         rowid = cursor.lastrowid
 
         if vec is not None:
@@ -8278,12 +8296,28 @@ class BeamMemory:
                 if proposals:
                     from mnemosyne.core import model_refresh
                     proposal_ts = datetime.now().isoformat()
+                    # PATCH (yallaplay, upstream issue #506): cap proposal
+                    # ranking importance. Confidence is the LLM's self-reported
+                    # belief in the proposal (kept in metadata for the review/
+                    # auto-apply flow); using it directly as importance let
+                    # review artifacts (routinely 0.85-0.95) outrank curated
+                    # content in recall and made them un-droppable by the
+                    # injection gate (drop requires importance < 0.65).
+                    try:
+                        proposal_importance_cap = float(
+                            os.environ.get("MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP", "0.5")
+                        )
+                    except (TypeError, ValueError):
+                        proposal_importance_cap = 0.5
                     for proposal in proposals:
                         metadata = model_refresh.prepare_proposal_metadata(proposal, source_wm_ids=ids)
                         proposal_id = self.remember(
                             model_refresh.proposal_to_memory_content(proposal),
                             source="sleep_model_refresh_proposal",
-                            importance=float(proposal.get("confidence") or 0.5),
+                            importance=min(
+                                float(proposal.get("confidence") or 0.5),
+                                proposal_importance_cap,
+                            ),
                             metadata=metadata,
                             scope="session",
                             veracity="inferred",
