@@ -7,6 +7,8 @@ import tempfile
 import sqlite3
 import time
 import os
+import gc
+import logging
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -737,6 +739,61 @@ class TestWorkingMemory:
         ctx = beam.get_context(limit=5)
         assert len(ctx) == 1
         assert ctx[0]["content"] == "Prefers Neovim"
+
+    def test_entity_annotations_only_boost_existing_recall_candidates(self, temp_db, monkeypatch):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        lexical_id = beam.remember("Atlas deployment notes", importance=0.1)
+        entity_only_id = beam.remember("unrelated status update", importance=1.0)
+
+        baseline = beam.recall("Atlas", top_k=1)
+        assert [row["id"] for row in baseline] == [lexical_id]
+        baseline_score = baseline[0]["score"]
+
+        monkeypatch.setattr(
+            beam_module,
+            "_find_memories_by_entity",
+            lambda _beam, _query: [lexical_id, entity_only_id],
+        )
+
+        results = beam.recall("Atlas", top_k=2)
+        result_ids = {row["id"] for row in results}
+        lexical_result = next(row for row in results if row["id"] == lexical_id)
+
+        assert entity_only_id not in result_ids
+        assert lexical_id in result_ids
+        assert lexical_result["entity_match"] is True
+        assert baseline_score < lexical_result["score"] <= min(baseline_score * 1.3, 1.0) + 0.0001
+
+    def test_entity_annotations_do_not_append_episodic_only_candidates(self, temp_db, monkeypatch):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        lexical_id = beam.consolidate_to_episodic(
+            summary="Atlas deployment notes", source_wm_ids=["wm-atlas"], importance=0.1,
+        )
+        entity_only_id = beam.consolidate_to_episodic(
+            summary="unrelated status update", source_wm_ids=["wm-other"], importance=1.0,
+        )
+
+        baseline = beam.recall("Atlas", top_k=1)
+        assert [row["id"] for row in baseline] == [lexical_id]
+        baseline_score = baseline[0]["score"]
+
+        entity_calls = []
+
+        def entity_matches(_beam, query):
+            entity_calls.append(query)
+            return [lexical_id, entity_only_id]
+
+        monkeypatch.setattr(beam_module, "_find_memories_by_entity", entity_matches)
+
+        results = beam.recall("Atlas", top_k=2)
+        result_ids = {row["id"] for row in results}
+        lexical_result = next(row for row in results if row["id"] == lexical_id)
+
+        assert entity_calls == ["Atlas"]
+        assert entity_only_id not in result_ids
+        assert lexical_id in result_ids
+        assert lexical_result["entity_match"] is True
+        assert baseline_score < lexical_result["score"] <= min(baseline_score * 1.3, 1.0) + 0.0001
 
     def test_get_context_keeps_global_first_then_session_order(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
@@ -1691,6 +1748,74 @@ class TestExportImport:
             stats = target.import_from_file(str(export_path))
             assert stats["legacy"]["inserted"] >= 1
             assert stats["beam"]["working_memory"]["inserted"] >= 1
+
+    def test_mnemosyne_import_is_idempotent_for_consolidation_log(self, temp_db):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Mnemosyne(session_id="s1", db_path=temp_db)
+            target = None
+            try:
+                source.conn.execute(
+                    """INSERT INTO consolidation_log
+                       (session_id, items_consolidated, summary_preview, created_at)
+                       VALUES (?, ?, ?, ?)""",
+                    ("s1", 209, "snapshot", "2026-08-24T08:00:00"),
+                )
+                source.conn.commit()
+                export_path = Path(tmpdir) / "export.json"
+                source.export_to_file(str(export_path))
+
+                target = Mnemosyne(session_id="s1", db_path=Path(tmpdir) / "target.db")
+                first = target.import_from_file(str(export_path))
+                second = target.import_from_file(str(export_path))
+
+                assert first["beam"]["consolidation_log"]["inserted"] == 1
+                assert second["beam"]["consolidation_log"]["skipped"] == 1
+                assert target.conn.execute(
+                    "SELECT COUNT(*) FROM consolidation_log"
+                ).fetchone()[0] == 1
+
+                target.conn.execute(
+                    """UPDATE consolidation_log
+                       SET session_id=?, items_consolidated=?, summary_preview=?, created_at=?
+                       WHERE id=?""",
+                    ("changed", 1, "changed", "2026-08-25T08:00:00", 1),
+                )
+                target.conn.commit()
+                forced = target.import_from_file(str(export_path), force=True)
+                assert forced["beam"]["consolidation_log"]["overwritten"] == 1
+                restored = target.conn.execute(
+                    """SELECT id, session_id, items_consolidated, summary_preview, created_at
+                       FROM consolidation_log WHERE id=?""",
+                    (1,),
+                ).fetchone()
+                assert tuple(restored) == (
+                    1, "s1", 209, "snapshot", "2026-08-24T08:00:00"
+                )
+                assert target.conn.execute(
+                    "SELECT COUNT(*) FROM consolidation_log"
+                ).fetchone()[0] == 1
+
+                legacy = {
+                    "consolidation_log": [{
+                        "session_id": "legacy", "items_consolidated": 3,
+                        "summary_preview": "legacy", "created_at": "2026-08-26T08:00:00",
+                    }]
+                }
+                legacy_first = target.beam.import_from_dict(legacy)
+                legacy_second = target.beam.import_from_dict(legacy)
+                assert legacy_first["consolidation_log"]["inserted"] == 1
+                assert legacy_second["consolidation_log"]["inserted"] == 1
+                assert target.conn.execute(
+                    "SELECT COUNT(*) FROM consolidation_log WHERE session_id=?", ("legacy",)
+                ).fetchone()[0] == 2
+            finally:
+                source.conn.close()
+                if target is not None:
+                    target.conn.close()
+                # import_from_file constructs short-lived store connections
+                # for the auxiliary tables.  Release those objects before
+                # Windows removes the temporary directory.
+                gc.collect()
 
     def test_import_from_dict_canonicalizes_valid_until(self, temp_db):
         """#525: import_from_dict must normalize offset-bearing valid_until
@@ -2836,6 +2961,40 @@ class TestConsolidationHealth:
         assert h["status"] == "healthy"
         assert h["last_successful_consolidation"] is not None
 
+    def test_health_error_count_ignores_successful_runs_mentioning_fail(self, temp_db):
+        """A successful consolidation whose summary text contains "fail" (#717)."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        conn = sqlite3.connect(temp_db)
+        conn.execute(
+            "INSERT INTO consolidation_log (session_id, items_consolidated, "
+            "summary_preview, created_at) VALUES (?, ?, ?, datetime('now'))",
+            ("s1", 3, "consolidated memory about a failed deployment postmortem"),
+        )
+        conn.commit()
+        conn.close()
+
+        h = beam.health()
+        assert h["error_count"] == 0
+
+    def test_health_error_count_still_counts_genuine_zero_item_failures(self, temp_db):
+        """A real failed run (zero items, error-shaped summary) still counts."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        conn = sqlite3.connect(temp_db)
+        conn.executemany(
+            "INSERT INTO consolidation_log (session_id, items_consolidated, "
+            "summary_preview, created_at) VALUES (?, ?, ?, datetime('now'))",
+            [
+                ("s1", 0, "error: provider timeout during consolidation"),
+                ("s1", 0, "consolidation failed: no working memory read lock"),
+                ("s1", 0, "nothing to consolidate"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        h = beam.health()
+        assert h["error_count"] == 2
+
 
 class TestUpdateRefreshesDerivedState:
     """Issue #110: update() must reindex FTS5 + recompute vector embeddings."""
@@ -3008,3 +3167,84 @@ class TestSameUtcDayFuture:
                 assert future > now, (hh, mm)
                 stored = future.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
                 assert stored < now.isoformat(), (hh, mm, stored)
+
+
+def test_remember_warns_when_embed_returns_none(temp_db, monkeypatch, caplog):
+    """Regression: remember() must warn when embeddings.available() is True
+    but embed([content]) returns None. Pre-fix this was a silent no-op: the
+    embedding was skipped with zero operator signal, mirroring the same bug
+    remember_batch() already logs (beam.py remember_batch None branch).
+    Content-free log: no memory id or content in the message."""
+    beam = BeamMemory(session_id="embed-none", db_path=temp_db)
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
+    monkeypatch.setattr(beam_module._embeddings, "embed", lambda contents: None)
+
+    with caplog.at_level(logging.WARNING, logger="mnemosyne.core.beam"):
+        memory_id = beam.remember("content that should be embedded", source="test")
+
+    # The memory itself must still land (embedding failure is non-fatal).
+    assert memory_id is not None
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?",
+        (memory_id,),
+    ).fetchone()[0] == 1
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, (
+        "remember() silently dropped embedding when embed() returned None -- "
+        "no WARNING logged (remember_batch already logs this; remember was missing it)"
+    )
+    assert "_embeddings.embed returned None" in warnings[0].getMessage()
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?",
+        (memory_id,),
+    ).fetchone()[0] == 0
+    # Content-free: message must not leak the memory id or the content.
+    msg = warnings[0].getMessage()
+    assert memory_id not in msg, (
+        f"WARNING log leaked memory id {memory_id!r}: {msg!r}"
+    )
+    assert "content that should be embedded" not in msg, (
+        f"WARNING log leaked memory content: {msg!r}"
+    )
+
+
+def test_remember_warns_when_embed_returns_wrong_count(temp_db, monkeypatch, caplog):
+    """Regression: remember() must warn when embed([content]) returns a list
+    whose length != 1 (the single input). Pre-fix this was a silent no-op
+    because the `len(vec) == 1` guard failed quietly. remember_batch() already
+    logs the analogous count-mismatch; remember() must match for consistency.
+    Content-free log: no memory id or content."""
+    beam = BeamMemory(session_id="embed-mismatch", db_path=temp_db)
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
+    # embed([one item]) returns two vectors -- a count mismatch.
+    monkeypatch.setattr(
+        beam_module._embeddings, "embed",
+        lambda contents: [[0.0] * beam_module.EMBEDDING_DIM,
+                          [0.0] * beam_module.EMBEDDING_DIM],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="mnemosyne.core.beam"):
+        memory_id = beam.remember("content for count mismatch check", source="test")
+
+    assert memory_id is not None
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?",
+        (memory_id,),
+    ).fetchone()[0] == 1
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, (
+        "remember() silently dropped embedding on count mismatch -- "
+        "no WARNING logged (the len(vec)==1 guard failed quietly)"
+    )
+    assert "embedding count mismatch (2 vectors for 1 input)" in warnings[0].getMessage()
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?",
+        (memory_id,),
+    ).fetchone()[0] == 0
+    msg = warnings[0].getMessage()
+    assert memory_id not in msg, (
+        f"WARNING log leaked memory id {memory_id!r}: {msg!r}"
+    )
+    assert "content for count mismatch check" not in msg, (
+        f"WARNING log leaked memory content: {msg!r}"
+    )
